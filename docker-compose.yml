@@ -1,0 +1,27 @@
+services:
+  portcrane:
+    build: .
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+      - "9090:9090"
+    volumes:
+      - ./examples:/config:ro
+    environment:
+      PORTCRANE_CONFIG: /config/config.yaml
+      PORTCRANE_LOG_LEVEL: info
+    depends_on:
+      - upstream-a
+      - upstream-b
+
+  upstream-a:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-text=upstream-a"]
+    ports:
+      - "9001:5678"
+
+  upstream-b:
+    image: hashicorp/http-echo:1.0.0
+    command: ["-text=upstream-b"]
+    ports:
+      - "9002:5678"
