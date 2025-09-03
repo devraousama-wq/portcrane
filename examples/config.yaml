@@ -1,0 +1,30 @@
+listeners:
+  - name: http
+    protocol: http
+    bind: ":8080"
+
+routes:
+  - name: default
+    match:
+      host: "*"
+      path_prefix: /
+    pool: default
+
+pools:
+  default:
+    policy: round_robin
+    upstreams:
+      - id: local
+        address: http://127.0.0.1:9001
+        weight: 1
+
+logging:
+  level: info
+  access: stdout
+
+metrics:
+  bind: ":9090"
+
+admin:
+  bind: ":8081"
+  token: changeme
