@@ -12,50 +12,44 @@ import (
 type Server struct {
 	cfg    *config.Config
 	logger *slog.Logger
-	http   *http.Server
+	http   []*http.Server
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	s := &Server{cfg: cfg, logger: logger}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-	s.http = &http.Server{Handler: mux}
-	return s, nil
+	return &Server{cfg: cfg, logger: logger}, nil
+}
+
+func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server, error) {
+	return New(cfg, logger)
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	errCh := make(chan error, len(s.cfg.Listeners))
-	started := 0
+	handler := NewHTTPProxy(s.cfg, s.logger)
+	errCh := make(chan error, 4)
 	for _, listener := range s.cfg.Listeners {
-		switch listener.Protocol {
-		case "http", "https":
-			started++
-			go func(l config.Listener) {
-				srv := *s.http
-				srv.Addr = l.Bind
-				s.logger.Info("listener starting", "name", l.Name, "bind", l.Bind, "protocol", l.Protocol)
-				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-					errCh <- fmt.Errorf("listener %s: %w", l.Name, err)
-				}
-			}(listener)
-		default:
-			return fmt.Errorf("unsupported listener protocol %q", listener.Protocol)
+		if listener.Protocol != "http" {
+			continue
 		}
-	}
-	if started == 0 {
-		return fmt.Errorf("no listeners started")
+		srv := &http.Server{Addr: listener.Bind, Handler: handler}
+		s.http = append(s.http, srv)
+		go func(l config.Listener, srv *http.Server) {
+			s.logger.Info("listener starting", "name", l.Name, "bind", l.Bind)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("listener %s: %w", l.Name, err)
+			}
+		}(listener, srv)
 	}
 	select {
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout())
+		shCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout())
 		defer cancel()
-		return s.http.Shutdown(shutdownCtx)
+		for _, srv := range s.http {
+			_ = srv.Shutdown(shCtx)
+		}
+		return nil
 	case err := <-errCh:
 		return err
 	}
