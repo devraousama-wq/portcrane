@@ -1,0 +1,23 @@
+listeners:
+  - name: tcp-echo
+    protocol: tcp
+    bind: ":9099"
+    tls: "127.0.0.1:9001"
+
+routes:
+  - name: default
+    match:
+      host: "*"
+      path_prefix: /
+    pool: default
+
+pools:
+  default:
+    policy: round_robin
+    upstreams:
+      - id: local
+        address: http://127.0.0.1:9001
+        weight: 1
+
+logging:
+  level: info
