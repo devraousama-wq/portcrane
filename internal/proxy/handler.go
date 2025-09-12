@@ -6,21 +6,26 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
+	"strings"
 	"time"
 
 	"github.com/devraousama-wq/portcrane/internal/config"
 	"github.com/devraousama-wq/portcrane/internal/routing"
+	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
 
 type HTTPProxy struct {
-	cfg    *config.Config
 	router *routing.Router
+	pools  *upstream.Manager
 	logger *slog.Logger
 }
 
-func NewHTTPProxy(cfg *config.Config, logger *slog.Logger) *HTTPProxy {
-	return &HTTPProxy{cfg: cfg, router: routing.New(cfg.Routes), logger: logger}
+func NewHTTPProxy(cfg *config.Config, pools *upstream.Manager, logger *slog.Logger) *HTTPProxy {
+	return &HTTPProxy{
+		router: routing.New(cfg.Routes),
+		pools:  pools,
+		logger: logger,
+	}
 }
 
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -29,18 +34,45 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no route", http.StatusNotFound)
 		return
 	}
-	pool, ok := p.cfg.Pools[route.Pool]
-	if !ok || len(pool.Upstreams) == 0 {
+	pool, ok := p.pools.Get(route.Pool)
+	if !ok {
 		http.Error(w, "unknown pool", http.StatusBadGateway)
 		return
 	}
-	targetURL, err := url.Parse(pool.Upstreams[0].Address)
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	ep, err := pool.Pick(clientIP)
 	if err != nil {
-		http.Error(w, "bad upstream", http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+	target := *ep.URL
+	target.Path = singleJoin(target.Path, r.URL.Path)
+	target.RawQuery = r.URL.RawQuery
+	proxy := httputil.NewSingleHostReverseProxy(&target)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		p.logger.Error("proxy error", "upstream", ep.ID, "error", err)
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	}
 	proxy.ServeHTTP(w, r)
+}
+
+func singleJoin(a, b string) string {
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	as := strings.HasSuffix(a, "/")
+	bs := strings.HasPrefix(b, "/")
+	switch {
+	case as && bs:
+		return a + b[1:]
+	case !as && !bs:
+		return a + "/" + b
+	default:
+		return a + b
+	}
 }
 
 type TCPProxy struct {
@@ -69,14 +101,14 @@ func (t *TCPProxy) Run() error {
 
 func (t *TCPProxy) handle(client net.Conn) {
 	defer client.Close()
-	upstream, err := net.DialTimeout("tcp", t.target, 5*time.Second)
+	upstreamConn, err := net.DialTimeout("tcp", t.target, 5*time.Second)
 	if err != nil {
 		t.logger.Error("tcp dial", "target", t.target, "error", err)
 		return
 	}
-	defer upstream.Close()
-	go ioCopy(upstream, client)
-	ioCopy(client, upstream)
+	defer upstreamConn.Close()
+	go ioCopy(upstreamConn, client)
+	ioCopy(client, upstreamConn)
 }
 
 func ioCopy(dst net.Conn, src net.Conn) {
