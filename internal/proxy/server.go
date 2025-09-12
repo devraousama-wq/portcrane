@@ -8,11 +8,13 @@ import (
 	"sync"
 
 	"github.com/devraousama-wq/portcrane/internal/config"
+	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
 
 type Server struct {
 	cfg    *config.Config
 	logger *slog.Logger
+	pools  *upstream.Manager
 	http   []*http.Server
 	tcp    []*TCPProxy
 	wg     sync.WaitGroup
@@ -22,7 +24,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Server{cfg: cfg, logger: logger}, nil
+	pools, err := upstream.NewManager(cfg.Pools)
+	if err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, logger: logger, pools: pools}, nil
 }
 
 func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server, error) {
@@ -30,7 +36,7 @@ func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server,
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	handler := NewHTTPProxy(s.cfg, s.logger)
+	handler := NewHTTPProxy(s.cfg, s.pools, s.logger)
 	errCh := make(chan error, 8)
 	for _, listener := range s.cfg.Listeners {
 		switch listener.Protocol {
