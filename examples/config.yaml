@@ -2,19 +2,61 @@ listeners:
   - name: http
     protocol: http
     bind: ":8080"
+  - name: https
+    protocol: https
+    bind: ":8443"
 
 routes:
+  - name: api
+    match:
+      host: api.localhost
+      path_prefix: /v1
+      headers:
+        X-Env: prod
+    pool: api
+    middleware:
+      - auth
+      - rate_limit
   - name: default
     match:
       host: "*"
       path_prefix: /
     pool: default
+    middleware:
+      - cors
 
 pools:
   default:
     policy: round_robin
     upstreams:
-      - id: local
+      - id: a
+        address: http://127.0.0.1:9001
+        weight: 2
+      - id: b
+        address: http://127.0.0.1:9002
+        weight: 1
+    health:
+      active:
+        enabled: true
+        protocol: http
+        path: /
+        interval: 5s
+        timeout: 1s
+        healthy_threshold: 2
+        unhealthy_threshold: 3
+      passive:
+        enabled: true
+        consecutive_errors: 3
+        max_failures: 5
+    breaker:
+      enabled: true
+      failure_ratio: 0.5
+      consecutive_5xx: 5
+      cooldown: 30s
+  api:
+    policy: ewma
+    upstreams:
+      - id: api-1
         address: http://127.0.0.1:9001
         weight: 1
 
@@ -28,3 +70,28 @@ metrics:
 admin:
   bind: ":8081"
   token: changeme
+
+tls:
+  hsts: true
+  certs:
+    - name: local
+      cert_file: certs/local.crt
+      key_file: certs/local.key
+      hosts:
+        - localhost
+  acme:
+    enabled: false
+    email: ops@example.com
+    cache_dir: data/acme
+    hosts:
+      - proxy.example.com
+
+discovery:
+  file:
+    enabled: true
+    path: data/upstreams.json
+    interval: 10s
+  dns:
+    enabled: false
+    name: _http._tcp.service.consul
+    interval: 30s
