@@ -1,0 +1,4 @@
+[
+  {"id": "a", "address": "http://127.0.0.1:9001", "weight": 2},
+  {"id": "b", "address": "http://127.0.0.1:9002", "weight": 1}
+]
