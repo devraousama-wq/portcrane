@@ -6,26 +6,61 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/devraousama-wq/portcrane/internal/config"
+	"github.com/devraousama-wq/portcrane/internal/health"
 	"github.com/devraousama-wq/portcrane/internal/routing"
 	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
 
 type HTTPProxy struct {
-	router *routing.Router
-	pools  *upstream.Manager
-	logger *slog.Logger
+	router  *routing.Router
+	pools   *upstream.Manager
+	passive *health.Passive
+	breaker *upstream.Breaker
+	logger  *slog.Logger
+	ewma    *upstream.EWMA
 }
 
 func NewHTTPProxy(cfg *config.Config, pools *upstream.Manager, logger *slog.Logger) *HTTPProxy {
-	return &HTTPProxy{
-		router: routing.New(cfg.Routes),
-		pools:  pools,
-		logger: logger,
+	router := routing.New(cfg.Routes)
+	var ewma *upstream.EWMA
+	for _, poolCfg := range cfg.Pools {
+		if poolCfg.Policy == "ewma" {
+			eps := make([]*upstream.Endpoint, 0)
+			for _, u := range poolCfg.Upstreams {
+				parsed, _ := url.Parse(u.Address)
+				eps = append(eps, &upstream.Endpoint{ID: u.ID, URL: parsed})
+			}
+			ewma = upstream.NewEWMA(eps)
+			break
+		}
 	}
+	var breaker *upstream.Breaker
+	for _, poolCfg := range cfg.Pools {
+		if poolCfg.Breaker.Enabled {
+			breaker = upstream.NewBreaker(poolCfg.Breaker)
+			break
+		}
+	}
+	return &HTTPProxy{
+		router:  router,
+		pools:   pools,
+		passive: health.NewPassive(firstPassive(cfg.Pools)),
+		breaker: breaker,
+		logger:  logger,
+		ewma:    ewma,
+	}
+}
+
+func firstPassive(pools config.Pools) config.PassiveHealth {
+	for _, p := range pools {
+		return p.Health.Passive
+	}
+	return config.PassiveHealth{}
 }
 
 func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +80,11 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	if p.breaker != nil && !p.breaker.Allow(ep.ID) {
+		http.Error(w, "circuit open", http.StatusServiceUnavailable)
+		return
+	}
+	start := time.Now()
 	target := *ep.URL
 	target.Path = singleJoin(target.Path, r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
@@ -53,7 +93,20 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logger.Error("proxy error", "upstream", ep.ID, "error", err)
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
-	proxy.ServeHTTP(w, r)
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		if p.passive != nil {
+			p.passive.Observe(pool, ep.ID, resp.StatusCode)
+		}
+		if p.breaker != nil {
+			p.breaker.Record(ep.ID, resp.StatusCode)
+		}
+		if p.ewma != nil {
+			p.ewma.Observe(ep.ID, float64(time.Since(start).Milliseconds()))
+		}
+		return nil
+	}
+	chain := proxy
+	chain.ServeHTTP(w, r)
 }
 
 func singleJoin(a, b string) string {
