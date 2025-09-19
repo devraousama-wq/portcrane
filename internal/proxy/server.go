@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/devraousama-wq/portcrane/internal/config"
+	"github.com/devraousama-wq/portcrane/internal/health"
 	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
 
@@ -37,6 +38,18 @@ func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server,
 
 func (s *Server) Run(ctx context.Context) error {
 	handler := NewHTTPProxy(s.cfg, s.pools, s.logger)
+	for _, poolName := range s.pools.Names() {
+		pool, _ := s.pools.Get(poolName)
+		active := s.cfg.Pools[poolName].Health.Active
+		checker := health.NewChecker(active)
+		if checker != nil {
+			s.wg.Add(1)
+			go func(p *upstream.Pool, cfg config.ActiveHealth) {
+				defer s.wg.Done()
+				checker.Run(ctx, p, cfg)
+			}(pool, active)
+		}
+	}
 	errCh := make(chan error, 8)
 	for _, listener := range s.cfg.Listeners {
 		switch listener.Protocol {
