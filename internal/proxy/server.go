@@ -13,12 +13,14 @@ import (
 )
 
 type Server struct {
-	cfg    *config.Config
-	logger *slog.Logger
-	pools  *upstream.Manager
-	http   []*http.Server
-	tcp    []*TCPProxy
-	wg     sync.WaitGroup
+	cfgPath string
+	store   *config.Store
+	cfg     *config.Config
+	logger  *slog.Logger
+	pools   *upstream.Manager
+	http    []*http.Server
+	tcp     []*TCPProxy
+	wg      sync.WaitGroup
 }
 
 func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
@@ -29,29 +31,50 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, logger: logger, pools: pools}, nil
+	return &Server{cfg: cfg, logger: logger, pools: pools, store: config.NewStore("", cfg, logger)}, nil
 }
 
 func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server, error) {
-	return New(cfg, logger)
+	s, err := New(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	s.cfgPath = path
+	s.store = config.NewStore(path, cfg, logger)
+	return s, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	handler := NewHTTPProxy(s.cfg, s.pools, s.logger)
+	cfg := s.cfg
+	if s.store != nil {
+		cfg = s.store.Current()
+	}
+	handler := NewHTTPProxy(cfg, s.pools, s.logger)
 	for _, poolName := range s.pools.Names() {
 		pool, _ := s.pools.Get(poolName)
-		active := s.cfg.Pools[poolName].Health.Active
+		active := cfg.Pools[poolName].Health.Active
 		checker := health.NewChecker(active)
 		if checker != nil {
 			s.wg.Add(1)
-			go func(p *upstream.Pool, cfg config.ActiveHealth) {
+			go func(p *upstream.Pool, active config.ActiveHealth) {
 				defer s.wg.Done()
-				checker.Run(ctx, p, cfg)
+				checker.Run(ctx, p, active)
 			}(pool, active)
 		}
 	}
+	if s.cfgPath != "" {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			_ = s.store.Watch(ctx, func(next *config.Config) {
+				if err := s.pools.Replace(next.Pools); err != nil {
+					s.logger.Warn("pool reload failed", "error", err)
+				}
+			})
+		}()
+	}
 	errCh := make(chan error, 8)
-	for _, listener := range s.cfg.Listeners {
+	for _, listener := range cfg.Listeners {
 		switch listener.Protocol {
 		case "http":
 			srv := &http.Server{Addr: listener.Bind, Handler: handler}
@@ -82,7 +105,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	select {
 	case <-ctx.Done():
-		shCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownTimeout())
+		shCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout())
 		defer cancel()
 		for _, srv := range s.http {
 			_ = srv.Shutdown(shCtx)
