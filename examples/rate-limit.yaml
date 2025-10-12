@@ -1,0 +1,15 @@
+routes:
+  - name: limited
+    match:
+      host: "*"
+      path_prefix: /api
+    pool: default
+    middleware:
+      - rate_limit
+pools:
+  default:
+    policy: round_robin
+    upstreams:
+      - id: a
+        address: http://127.0.0.1:9001
+        weight: 1
