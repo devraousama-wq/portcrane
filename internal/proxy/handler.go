@@ -12,6 +12,7 @@ import (
 
 	"github.com/devraousama-wq/portcrane/internal/config"
 	"github.com/devraousama-wq/portcrane/internal/health"
+	"github.com/devraousama-wq/portcrane/internal/middleware"
 	"github.com/devraousama-wq/portcrane/internal/routing"
 	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
@@ -105,8 +106,8 @@ func (p *HTTPProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return nil
 	}
-	chain := proxy
-	chain.ServeHTTP(w, r)
+	chain := middleware.NewChain(middleware.WithRequestID)
+	chain.Then(proxy).ServeHTTP(w, r)
 }
 
 func singleJoin(a, b string) string {
