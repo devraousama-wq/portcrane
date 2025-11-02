@@ -8,17 +8,18 @@ import (
 	"sync"
 
 	"github.com/devraousama-wq/portcrane/internal/config"
+	"github.com/devraousama-wq/portcrane/internal/discovery"
 	"github.com/devraousama-wq/portcrane/internal/health"
+	tlsmgr "github.com/devraousama-wq/portcrane/internal/tls"
 	"github.com/devraousama-wq/portcrane/internal/upstream"
 )
 
 type Server struct {
 	cfgPath string
 	store   *config.Store
-	cfg     *config.Config
 	logger  *slog.Logger
 	pools   *upstream.Manager
-	http    []*http.Server
+	httpSrv []*http.Server
 	tcp     []*TCPProxy
 	wg      sync.WaitGroup
 }
@@ -31,7 +32,7 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{cfg: cfg, logger: logger, pools: pools, store: config.NewStore("", cfg, logger)}, nil
+	return &Server{store: config.NewStore("", cfg, logger), logger: logger, pools: pools}, nil
 }
 
 func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server, error) {
@@ -45,10 +46,7 @@ func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server,
 }
 
 func (s *Server) Run(ctx context.Context) error {
-	cfg := s.cfg
-	if s.store != nil {
-		cfg = s.store.Current()
-	}
+	cfg := s.store.Current()
 	handler := NewHTTPProxy(cfg, s.pools, s.logger)
 	for _, poolName := range s.pools.Names() {
 		pool, _ := s.pools.Get(poolName)
@@ -61,6 +59,28 @@ func (s *Server) Run(ctx context.Context) error {
 				checker.Run(ctx, p, active)
 			}(pool, active)
 		}
+	}
+	bus := discovery.NewBus()
+	bus.Subscribe(func(ev discovery.Event) {
+		if err := discovery.ApplyEvent(s.pools, ev, cfg.Pools); err != nil {
+			s.logger.Warn("discovery apply failed", "error", err)
+		}
+	})
+	fileWatcher := discovery.NewFileWatcher(cfg.Discovery.File, "default", bus)
+	if fileWatcher != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			_ = fileWatcher.Run(ctx)
+		}()
+	}
+	dnsWatcher := discovery.NewDNSWatcher(cfg.Discovery.DNS, "default", bus)
+	if dnsWatcher != nil {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			_ = dnsWatcher.Run(ctx)
+		}()
 	}
 	if s.cfgPath != "" {
 		s.wg.Add(1)
@@ -76,21 +96,40 @@ func (s *Server) Run(ctx context.Context) error {
 	errCh := make(chan error, 8)
 	for _, listener := range cfg.Listeners {
 		switch listener.Protocol {
-		case "http":
+		case "http", "https":
 			srv := &http.Server{Addr: listener.Bind, Handler: handler}
-			s.http = append(s.http, srv)
+			if listener.Protocol == "https" {
+				tlsManager, err := tlsmgr.NewStatic(cfg.TLS)
+				if err == nil && len(cfg.TLS.Certs) > 0 {
+					srv.TLSConfig = tlsManager.TLSConfig()
+				}
+				acme, err := tlsmgr.NewACME(cfg.TLS.ACME)
+				if err != nil {
+					return err
+				}
+				if acme != nil {
+					srv.TLSConfig = acme.TLSConfig()
+				}
+			}
+			s.httpSrv = append(s.httpSrv, srv)
 			s.wg.Add(1)
 			go func(l config.Listener, srv *http.Server) {
 				defer s.wg.Done()
 				s.logger.Info("listener starting", "name", l.Name, "bind", l.Bind, "protocol", l.Protocol)
-				if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				var err error
+				if l.Protocol == "https" {
+					err = srv.ListenAndServeTLS("", "")
+				} else {
+					err = srv.ListenAndServe()
+				}
+				if err != nil && err != http.ErrServerClosed {
 					errCh <- fmt.Errorf("listener %s: %w", l.Name, err)
 				}
 			}(listener, srv)
 		case "tcp":
 			target := listener.TLS
 			if target == "" {
-				return fmt.Errorf("tcp listener %s requires target in tls field", listener.Name)
+				return fmt.Errorf("tcp listener %s requires target address in tls field", listener.Name)
 			}
 			tcp := NewTCPProxy(listener.Bind, target, s.logger)
 			s.tcp = append(s.tcp, tcp)
@@ -105,10 +144,10 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	select {
 	case <-ctx.Done():
-		shCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout())
 		defer cancel()
-		for _, srv := range s.http {
-			_ = srv.Shutdown(shCtx)
+		for _, srv := range s.httpSrv {
+			_ = srv.Shutdown(shutdownCtx)
 		}
 		s.wg.Wait()
 		return nil
