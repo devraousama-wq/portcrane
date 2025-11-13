@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/devraousama-wq/portcrane/internal/admin"
 	"github.com/devraousama-wq/portcrane/internal/config"
 	"github.com/devraousama-wq/portcrane/internal/discovery"
 	"github.com/devraousama-wq/portcrane/internal/health"
@@ -20,6 +21,7 @@ type Server struct {
 	logger  *slog.Logger
 	pools   *upstream.Manager
 	httpSrv []*http.Server
+	admin   *http.Server
 	tcp     []*TCPProxy
 	wg      sync.WaitGroup
 }
@@ -32,7 +34,11 @@ func New(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{store: config.NewStore("", cfg, logger), logger: logger, pools: pools}, nil
+	return &Server{
+		store:  config.NewStore("", cfg, logger),
+		logger: logger,
+		pools:  pools,
+	}, nil
 }
 
 func NewWithPath(path string, cfg *config.Config, logger *slog.Logger) (*Server, error) {
@@ -140,7 +146,19 @@ func (s *Server) Run(ctx context.Context) error {
 					errCh <- err
 				}
 			}(tcp)
+		default:
+			return fmt.Errorf("unsupported listener protocol %q", listener.Protocol)
 		}
+	}
+	if cfg.Admin.Bind != "" {
+		s.admin = admin.New(cfg.Admin.Bind, cfg.Admin.Token, s.store.Current, s.pools)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			if err := s.admin.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- fmt.Errorf("admin: %w", err)
+			}
+		}()
 	}
 	select {
 	case <-ctx.Done():
@@ -148,6 +166,9 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cancel()
 		for _, srv := range s.httpSrv {
 			_ = srv.Shutdown(shutdownCtx)
+		}
+		if s.admin != nil {
+			_ = s.admin.Shutdown(shutdownCtx)
 		}
 		s.wg.Wait()
 		return nil
